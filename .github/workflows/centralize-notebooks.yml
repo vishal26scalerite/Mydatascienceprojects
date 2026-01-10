@@ -1,0 +1,114 @@
+name: Centralize notebooks into notebooks/
+
+on:
+  workflow_dispatch:
+
+jobs:
+  move-notebooks:
+    name: Move notebooks and open PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Install dependencies (jq)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Prepare branch from main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git fetch origin main:refs/remotes/origin/main
+          git checkout -B centralize-notebooks origin/main
+
+      - name: Move .ipynb files into notebooks/ preserving top-level subfolders
+        run: |
+          set -euo pipefail
+          mapfile -t FILES < <(git ls-files '*.ipynb' | grep -v '^notebooks/' || true)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No .ipynb files to move. Exiting."
+            exit 0
+          fi
+
+          echo "Found ${#FILES[@]} notebooks to move."
+          for f in "${FILES[@]}"; do
+            if [[ "$f" != */* ]]; then
+              dest_dir="notebooks"
+              dest_path="$dest_dir/$(basename "$f")"
+            else
+              top_level=$(echo "$f" | awk -F/ '{print $1}')
+              tail_path=$(echo "$f" | cut -d/ -f2-)
+              dest_dir="notebooks/$top_level"
+              dest_path="$dest_dir/$tail_path"
+            fi
+            mkdir -p "$dest_dir"
+            echo "Moving: '$f' -> '$dest_path'"
+            git mv -f "$f" "$dest_path"
+          done
+
+          if [ ! -f notebooks/README.md ]; then
+            cat > notebooks/README.md <<'EOF'
+This folder centralizes Jupyter notebooks for the repository.
+
+What changed:
+- All .ipynb files were moved into the top-level `notebooks/` folder.
+- Original relative folder structure is preserved under `notebooks/`.
+- Only .ipynb files were moved; other file types were left in place.
+
+EOF
+            git add notebooks/README.md
+          fi
+
+          if git status --porcelain | grep -q .; then
+            git add -A
+            git commit -m "chore: move notebooks into notebooks/ (preserve subfolders)"
+          else
+            echo "No changes to commit after moving."
+            exit 0
+          fi
+
+      - name: Push branch (overwrite if exists)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git push --force --set-upstream origin centralize-notebooks
+
+      - name: Create or update PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY}"
+          OWNER="${REPO%%/*}"
+          REPO_NAME="${REPO##*/}"
+          PR_TITLE="Centralize notebooks into notebooks/"
+          PR_BODY="This PR centralizes Jupyter notebooks into the top-level \`notebooks/\` folder. Only \`.ipynb\` files were relocated; other files were left unchanged.\n\nThe branch was created from \`main\` and all moves were committed in a single commit.\n\nIf you wish a different layout, please update and re-run."
+
+          existing_pr=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$OWNER/$REPO_NAME/pulls?head=$OWNER:centralize-notebooks")
+
+          pr_count=$(echo "$existing_pr" | jq 'length')
+          if [ "$pr_count" -eq 0 ]; then
+            payload=$(jq -n --arg title "$PR_TITLE" --arg head "centralize-notebooks" --arg base "main" --arg body "$PR_BODY" \
+                      '{title:$title,head:$head,base:$base,body:$body}')
+            curl -s -H "Authorization: token $GITHUB_TOKEN" \
+                 -H "Content-Type: application/json" \
+                 -d "$payload" \
+                 "https://api.github.com/repos/$OWNER/$REPO_NAME/pulls"
+          else
+            pr_number=$(echo "$existing_pr" | jq '.[0].number')
+            payload=$(jq -n --arg body "$PR_BODY" '{body:$body}')
+            curl -s -X PATCH -H "Authorization: token $GITHUB_TOKEN" \
+                 -H "Content-Type: application/json" \
+                 -d "$payload" \
+                 "https://api.github.com/repos/$OWNER/$REPO_NAME/pulls/$pr_number"
+          fi
